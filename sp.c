@@ -372,32 +372,57 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  // TODO: Determine whether the current process is SP main.
-  //       After that, you may want to make the following code the same for both
-  //       SP main and SP child processes. Therefore, you will set some
-  //       variables here.
-
-  // end TODO
+  InputBuffer input = {0};
 
   while (1) {
     char *command_buffer = NULL;
-    Command command = {.buf = command_buffer, .len = 0, .type = UNKNOWN};
-    // TODO: poll the STDIO/FIFO for commands.
+    size_t command_length = 0;
+    int read_result = read_command_line(STDIN_FILENO, &input,
+                                        &command_buffer, &command_length);
 
-    // end TODO
+    if (read_result == READ_LINE_EOF) {
+      break;
+    }
+    if (read_result == READ_LINE_ERROR) {
+      free(input.data);
+      free_table();
+      return 1;
+    }
 
-    // TODO: poll parent, and child processes for custom commands.
+    Command command = {
+        .buf = command_buffer,
+        .len = command_length,
+        .type = classify_command(command_buffer, command_length),
+    };
 
-    // end TODO
+    if (command.type == KILL) {
+      free(command_buffer);
+      free_table();
+      free(input.data);
+      return 0;
+    }
 
-    // TODO: classify the command and execute it.
-    command_handler(&command);
-    // end TODO
+    if (command.type == UNKNOWN) {
+      fprintf(stderr, "Unknown command\n");
+      free(command_buffer);
+      free_table();
+      free(input.data);
+      return 1;
+    }
 
-    // TODO: handle custom commands.
+    if (command_handler(&command) < 0) {
+      free(command_buffer);
+      free_table();
+      free(input.data);
+      return 1;
+    }
 
-    // end TODO
+    free(command_buffer);
   }
+
+  free(input.data);
+  free_table();
+  return 0;
 }
 
 int command_handler(Command *cmd) {
