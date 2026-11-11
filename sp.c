@@ -3,6 +3,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#ifndef _WIN32
+#include <sys/select.h>
+#endif
 #include <sys/stat.h>
 #include <sys/types.h>
 #ifndef _WIN32
@@ -32,6 +35,10 @@ typedef struct Child {
   pid_t pid;
   int command_fd;
   int reply_fd;
+  int request_fd;
+  int response_fd;
+  InputBuffer request_input;
+  InputBuffer reply_input;
   char *command_path;
   char *reply_path;
   struct Child *next;
@@ -45,6 +52,9 @@ enum {
 
 static Entry *table = NULL;
 static Child *children = NULL;
+static int parent_request_fd = -1;
+static int parent_response_fd = -1;
+static InputBuffer parent_response_input = {0};
 static Entry *find_entry(const char *key);
 static int set_entry(const char *key, const char *value);
 static int remove_entry(const char *key);
@@ -336,6 +346,14 @@ static void free_child(Child *child) {
   if (child->reply_fd >= 0) {
     close(child->reply_fd);
   }
+  if (child->request_fd >= 0) {
+    close(child->request_fd);
+  }
+  if (child->response_fd >= 0) {
+    close(child->response_fd);
+  }
+  free(child->request_input.data);
+  free(child->reply_input.data);
   unlink(child->command_path);
   unlink(child->reply_path);
   free(child->command_path);
@@ -440,6 +458,131 @@ static int read_command_line(int fd, InputBuffer *input, char **line,
   }
 }
 
+static int command_target(const char *line, size_t line_len,
+                          size_t *target_start, size_t *target_end) {
+  size_t start = 0;
+  while (start < line_len && line[start] != ' ') {
+    start++;
+  }
+  if (start == line_len) {
+    return -1;
+  }
+  start++;
+  *target_start = start;
+  while (start < line_len && line[start] != ' ') {
+    start++;
+  }
+  if (start == *target_start) {
+    return -1;
+  }
+  *target_end = start;
+  return 0;
+}
+
+static Child *find_child_target(const char *target, size_t target_len) {
+  for (Child *child = children; child != NULL; child = child->next) {
+    if (strlen(child->command_path) == target_len &&
+        memcmp(child->command_path, target, target_len) == 0) {
+      return child;
+    }
+    if (strlen(child->reply_path) == target_len &&
+        memcmp(child->reply_path, target, target_len) == 0) {
+      return child;
+    }
+  }
+  return NULL;
+}
+
+static int write_child_command(Child *child, const char *line,
+                               size_t line_len, size_t target_end) {
+  size_t command_start = 0;
+  size_t command_len;
+
+  while (command_start < line_len && line[command_start] != ' ') {
+    command_start++;
+  }
+  if (command_start == line_len || target_end == line_len) {
+    return -1;
+  }
+  command_start++;
+  while (command_start < line_len && line[command_start] != ' ') {
+    command_start++;
+  }
+  if (command_start == line_len) {
+    return -1;
+  }
+  command_start++;
+  command_len = line_len - command_start;
+  if (dprintf(child->command_fd, "%.*s\n", (int)command_len,
+              line + command_start) < 0) {
+    return -1;
+  }
+  return 0;
+}
+
+static int handle_root_command(char *line, size_t line_len) {
+  size_t target_start;
+  size_t target_end;
+  Child *child;
+  Command command;
+
+  if (classify_command(line, line_len) == CREATE) {
+    command.buf = line;
+    command.len = line_len;
+    command.type = CREATE;
+    return command_handler(&command);
+  }
+
+  if (command_target(line, line_len, &target_start, &target_end) == 0) {
+    child = find_child_target(line + target_start,
+                              target_end - target_start);
+    if (child != NULL) {
+      return write_child_command(child, line, line_len, target_end);
+    }
+    if (target_end < line_len &&
+        target_end - target_start == strlen("main") &&
+        memcmp(line + target_start, "main", strlen("main")) == 0) {
+      size_t command_len = strlen(line) - (target_end + 1);
+      memmove(line, line + target_end + 1, command_len);
+      line[command_len] = '\0';
+      line_len = command_len;
+    }
+  }
+
+  command.buf = line;
+  command.len = line_len;
+  command.type = classify_command(line, line_len);
+  if (command.type == KILL) {
+    return 1;
+  }
+  if (command.type == UNKNOWN) {
+    return -1;
+  }
+  return command_handler(&command);
+}
+
+static int handle_parent_request(Child *child, char *line, size_t line_len) {
+  char *hash = NULL;
+  char *key = NULL;
+  Entry *entry;
+
+  if (parse_two_keys(line, line_len, "F", &hash, &key) != 0) {
+    free(hash);
+    free(key);
+    return -1;
+  }
+  entry = find_entry(key);
+  if (entry == NULL ||
+      dprintf(child->response_fd, "R %s %s\n", hash, entry->value) < 0) {
+    free(hash);
+    free(key);
+    return -1;
+  }
+  free(hash);
+  free(key);
+  return 0;
+}
+
 static int run_command_loop(int input_fd) {
   InputBuffer input = {0};
   int result_code = 0;
@@ -470,7 +613,64 @@ static int run_command_loop(int input_fd) {
       free(command_buffer);
       break;
     }
-    if (command.type == UNKNOWN || command_handler(&command) < 0) {
+    int handler_result = command.type == UNKNOWN
+                             ? -1
+                             : command_handler(&command);
+    if (handler_result == 1 && command.type == FETCH &&
+        parent_request_fd >= 0 && parent_response_fd >= 0) {
+      char *hash = NULL;
+      char *key = NULL;
+      char *response = NULL;
+      size_t response_len = 0;
+      if (parse_two_keys(command_buffer, command_length, "fetch", &hash,
+                         &key) != 0 ||
+          dprintf(parent_request_fd, "F %s %s\n", hash, key) < 0 ||
+          read_command_line(parent_response_fd, &parent_response_input,
+                            &response, &response_len) != READ_LINE_OK) {
+        free(hash);
+        free(key);
+        free(response);
+        free(command_buffer);
+        result_code = 1;
+        break;
+      }
+
+      if (response_len < 3 || response[0] != 'R' || response[1] != ' ') {
+        free(hash);
+        free(key);
+        free(response);
+        free(command_buffer);
+        result_code = 1;
+        break;
+      }
+      char *response_hash = NULL;
+      char *response_value = NULL;
+      size_t separator = 2;
+      while (separator < response_len && response[separator] != ' ') {
+        separator++;
+      }
+      if (separator == response_len ||
+          copy_range(response + 2, separator - 2, &response_hash) != 0 ||
+          copy_range(response + separator + 1,
+                     response_len - separator - 1, &response_value) != 0 ||
+          strcmp(response_hash, hash) != 0 ||
+          dprintf(STDOUT_FILENO, "%s %s\n", response_hash,
+                  response_value) < 0) {
+        free(hash);
+        free(key);
+        free(response);
+        free(response_hash);
+        free(response_value);
+        free(command_buffer);
+        result_code = 1;
+        break;
+      }
+      free(hash);
+      free(key);
+      free(response);
+      free(response_hash);
+      free(response_value);
+    } else if (handler_result < 0) {
       free(command_buffer);
       result_code = 1;
       break;
@@ -537,6 +737,8 @@ static int run_child(const char *command_path, const char *reply_path,
   }
 
   int result = run_command_loop(command_fd);
+  free(parent_response_input.data);
+  parent_response_input = (InputBuffer){0};
   close(command_fd);
   unlink(command_path);
   unlink(reply_path);
@@ -544,15 +746,116 @@ static int run_child(const char *command_path, const char *reply_path,
 }
 
 int main(int argc, char *argv[]) {
-  if (argc == 5 && strcmp(argv[1], "--child") == 0) {
-    return run_child(argv[2], argv[3], atoi(argv[4]));
+  if (argc == 7 && strcmp(argv[1], "--child") == 0) {
+    parent_response_fd = atoi(argv[4]);
+    parent_request_fd = atoi(argv[5]);
+    return run_child(argv[2], argv[3], atoi(argv[6]));
   }
   if (argc > 1) {
     fprintf(stderr, "Usage: ./sp\n");
     return 1;
   }
 
-  int result = run_command_loop(STDIN_FILENO);
+  InputBuffer input = {0};
+  int result = 0;
+  int running = 1;
+
+#ifndef _WIN32
+  while (running) {
+    fd_set read_set;
+    int max_fd = STDIN_FILENO;
+
+    FD_ZERO(&read_set);
+    FD_SET(STDIN_FILENO, &read_set);
+    for (Child *child = children; child != NULL; child = child->next) {
+      FD_SET(child->reply_fd, &read_set);
+      FD_SET(child->request_fd, &read_set);
+      if (child->reply_fd > max_fd) {
+        max_fd = child->reply_fd;
+      }
+      if (child->request_fd > max_fd) {
+        max_fd = child->request_fd;
+      }
+    }
+
+    if (select(max_fd + 1, &read_set, NULL, NULL, NULL) < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      perror("select");
+      result = 1;
+      break;
+    }
+
+    for (Child *child = children; child != NULL && running;
+         child = child->next) {
+      if (FD_ISSET(child->request_fd, &read_set)) {
+        char *request = NULL;
+        size_t request_len = 0;
+        int read_result = read_command_line(child->request_fd,
+                                            &child->request_input, &request,
+                                            &request_len);
+        if (read_result != READ_LINE_OK ||
+            handle_parent_request(child, request, request_len) < 0) {
+          free(request);
+          result = 1;
+          running = 0;
+          continue;
+        }
+        free(request);
+      }
+      if (!FD_ISSET(child->reply_fd, &read_set)) {
+        continue;
+      }
+
+      char *reply = NULL;
+      size_t reply_len = 0;
+      int read_result = read_command_line(child->reply_fd,
+                                          &child->reply_input, &reply,
+                                          &reply_len);
+      if (read_result != READ_LINE_OK) {
+        free(reply);
+        result = 1;
+        running = 0;
+        continue;
+      }
+      if (dprintf(STDOUT_FILENO, "%.*s\n", (int)reply_len, reply) < 0) {
+        free(reply);
+        result = 1;
+        running = 0;
+        continue;
+      }
+      free(reply);
+    }
+
+    if (!running || !FD_ISSET(STDIN_FILENO, &read_set)) {
+      continue;
+    }
+
+    char *command_buffer = NULL;
+    size_t command_length = 0;
+    int read_result = read_command_line(STDIN_FILENO, &input,
+                                        &command_buffer, &command_length);
+    if (read_result == READ_LINE_EOF) {
+      free(command_buffer);
+      break;
+    }
+    if (read_result != READ_LINE_OK ||
+        handle_root_command(command_buffer, command_length) < 0) {
+      free(command_buffer);
+      result = 1;
+      break;
+    }
+    if (classify_command(command_buffer, command_length) == KILL) {
+      running = 0;
+    }
+    free(command_buffer);
+  }
+#else
+  result = run_command_loop(STDIN_FILENO);
+#endif
+
+  free(input.data);
   terminate_children();
   return result;
 }
@@ -581,13 +884,22 @@ int create_handler(char *buf, size_t len) {
   char *command_path = NULL;
   char *reply_path = NULL;
   int ready_pipe[2] = {-1, -1};
+  int request_pipe[2] = {-1, -1};
+  int response_pipe[2] = {-1, -1};
 
   if (parse_two_keys(buf, len, "create", &command_path, &reply_path) != 0) {
     fprintf(stderr, "Invalid create command\n");
     return -1;
   }
-  if (pipe(ready_pipe) < 0) {
+  if (pipe(ready_pipe) < 0 || pipe(request_pipe) < 0 ||
+      pipe(response_pipe) < 0) {
     perror("pipe");
+    close(request_pipe[0]);
+    close(request_pipe[1]);
+    close(response_pipe[0]);
+    close(response_pipe[1]);
+    close(ready_pipe[0]);
+    close(ready_pipe[1]);
     free(command_path);
     free(reply_path);
     return -1;
@@ -598,6 +910,10 @@ int create_handler(char *buf, size_t len) {
     perror("fork");
     close(ready_pipe[0]);
     close(ready_pipe[1]);
+    close(request_pipe[0]);
+    close(request_pipe[1]);
+    close(response_pipe[0]);
+    close(response_pipe[1]);
     free(command_path);
     free(reply_path);
     return -1;
@@ -605,16 +921,26 @@ int create_handler(char *buf, size_t len) {
 
   if (pid == 0) {
     char ready_fd_text[32];
+    char response_fd_text[32];
+    char request_fd_text[32];
 
     close(ready_pipe[0]);
+    close(request_pipe[0]);
+    close(response_pipe[1]);
     snprintf(ready_fd_text, sizeof(ready_fd_text), "%d", ready_pipe[1]);
+    snprintf(response_fd_text, sizeof(response_fd_text), "%d",
+             response_pipe[0]);
+    snprintf(request_fd_text, sizeof(request_fd_text), "%d",
+             request_pipe[1]);
     execl("./sp", "./sp", "--child", command_path, reply_path,
-          ready_fd_text, (char *)NULL);
+          response_fd_text, request_fd_text, ready_fd_text, (char *)NULL);
     perror("exec ./sp");
     _exit(127);
   }
 
   close(ready_pipe[1]);
+  close(request_pipe[1]);
+  close(response_pipe[0]);
   char ready = '\0';
   ssize_t ready_result;
   do {
@@ -630,6 +956,8 @@ int create_handler(char *buf, size_t len) {
     unlink(reply_path);
     free(command_path);
     free(reply_path);
+    close(request_pipe[0]);
+    close(response_pipe[1]);
     return -1;
   }
 
@@ -649,6 +977,8 @@ int create_handler(char *buf, size_t len) {
   if (parent_reply_fd < 0) {
     perror("open child reply FIFO");
     close(parent_command_fd);
+    close(request_pipe[0]);
+    close(response_pipe[1]);
     stop_child(pid);
     reap_child(pid);
     unlink(command_path);
@@ -663,6 +993,8 @@ int create_handler(char *buf, size_t len) {
     perror("malloc child");
     close(parent_command_fd);
     close(parent_reply_fd);
+    close(request_pipe[0]);
+    close(response_pipe[1]);
     stop_child(pid);
     reap_child(pid);
     unlink(command_path);
@@ -675,6 +1007,8 @@ int create_handler(char *buf, size_t len) {
   child->pid = pid;
   child->command_fd = parent_command_fd;
   child->reply_fd = parent_reply_fd;
+  child->request_fd = request_pipe[0];
+  child->response_fd = response_pipe[1];
   child->command_path = command_path;
   child->reply_path = reply_path;
   child->next = children;
