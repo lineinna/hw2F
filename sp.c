@@ -1,6 +1,15 @@
 #include "sp.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#ifndef _WIN32
+#include <sys/wait.h>
+#else
+#include <process.h>
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +28,15 @@ typedef struct {
   size_t capacity;
 } InputBuffer;
 
+typedef struct Child {
+  pid_t pid;
+  int command_fd;
+  int reply_fd;
+  char *command_path;
+  char *reply_path;
+  struct Child *next;
+} Child;
+
 enum {
   READ_LINE_OK = 0,
   READ_LINE_EOF = 1,
@@ -26,6 +44,7 @@ enum {
 };
 
 static Entry *table = NULL;
+static Child *children = NULL;
 static Entry *find_entry(const char *key);
 static int set_entry(const char *key, const char *value);
 static int remove_entry(const char *key);
@@ -39,6 +58,9 @@ static int parse_single_key(const char *line, size_t line_len,
                             const char *name, char **key);
 static int parse_two_keys(const char *line, size_t line_len, const char *name,
                           char **first, char **second);
+static int run_child(const char *command_path, const char *reply_path,
+                     int ready_fd);
+static void terminate_children(void);
 
 static int command_name_matches(const char *line, size_t line_len,
                                 const char *name) {
@@ -287,6 +309,58 @@ static void free_table(void) {
   table = NULL;
 }
 
+static void reap_child(pid_t pid) {
+#ifdef _WIN32
+  int status;
+  _cwait(&status, pid, 0);
+#else
+  waitpid(pid, NULL, 0);
+#endif
+}
+
+static void stop_child(pid_t pid) {
+#ifdef _WIN32
+  _kill(pid, SIGTERM);
+#else
+  kill(pid, SIGTERM);
+#endif
+}
+
+static void free_child(Child *child) {
+  if (child == NULL) {
+    return;
+  }
+  if (child->command_fd >= 0) {
+    close(child->command_fd);
+  }
+  if (child->reply_fd >= 0) {
+    close(child->reply_fd);
+  }
+  unlink(child->command_path);
+  unlink(child->reply_path);
+  free(child->command_path);
+  free(child->reply_path);
+  free(child);
+}
+
+static void terminate_children(void) {
+  Child *child = children;
+
+  while (child != NULL) {
+    stop_child(child->pid);
+    child = child->next;
+  }
+
+  child = children;
+  while (child != NULL) {
+    Child *next = child->next;
+    reap_child(child->pid);
+    free_child(child);
+    child = next;
+  }
+  children = NULL;
+}
+
 static int read_command_line(int fd, InputBuffer *input, char **line,
                              size_t *line_len) {
   char chunk[4096];
@@ -366,27 +440,24 @@ static int read_command_line(int fd, InputBuffer *input, char **line,
   }
 }
 
-int main(int argc, char *argv[]) {
-  if (argc > 1) {
-    fprintf(stderr, "Usage: ./sp\n");
-    return 1;
-  }
-
+static int run_command_loop(int input_fd) {
   InputBuffer input = {0};
+  int result_code = 0;
 
-  while (1) {
+  for (;;) {
     char *command_buffer = NULL;
     size_t command_length = 0;
-    int read_result = read_command_line(STDIN_FILENO, &input,
-                                        &command_buffer, &command_length);
+    int read_result = read_command_line(input_fd, &input, &command_buffer,
+                                        &command_length);
 
     if (read_result == READ_LINE_EOF) {
+      free(command_buffer);
       break;
     }
     if (read_result == READ_LINE_ERROR) {
-      free(input.data);
-      free_table();
-      return 1;
+      free(command_buffer);
+      result_code = 1;
+      break;
     }
 
     Command command = {
@@ -397,32 +468,93 @@ int main(int argc, char *argv[]) {
 
     if (command.type == KILL) {
       free(command_buffer);
-      free_table();
-      free(input.data);
-      return 0;
+      break;
     }
-
-    if (command.type == UNKNOWN) {
-      fprintf(stderr, "Unknown command\n");
+    if (command.type == UNKNOWN || command_handler(&command) < 0) {
       free(command_buffer);
-      free_table();
-      free(input.data);
-      return 1;
+      result_code = 1;
+      break;
     }
-
-    if (command_handler(&command) < 0) {
-      free(command_buffer);
-      free_table();
-      free(input.data);
-      return 1;
-    }
-
     free(command_buffer);
   }
 
   free(input.data);
   free_table();
-  return 0;
+  return result_code;
+}
+
+static int run_child(const char *command_path, const char *reply_path,
+                     int ready_fd) {
+  int command_fd = -1;
+  int reply_fd = -1;
+
+  if (mkfifo(command_path, 0600) < 0 && errno != EEXIST) {
+    perror("mkfifo command");
+    close(ready_fd);
+    return 1;
+  }
+  if (mkfifo(reply_path, 0600) < 0 && errno != EEXIST) {
+    perror("mkfifo reply");
+    unlink(command_path);
+    close(ready_fd);
+    return 1;
+  }
+
+  if (write(ready_fd, "R", 1) != 1) {
+    perror("child ready");
+    close(ready_fd);
+    unlink(command_path);
+    unlink(reply_path);
+    return 1;
+  }
+  close(ready_fd);
+
+  command_fd = open(command_path, O_RDONLY);
+  if (command_fd < 0) {
+    perror("open command FIFO");
+    unlink(command_path);
+    unlink(reply_path);
+    return 1;
+  }
+  reply_fd = open(reply_path, O_WRONLY);
+  if (reply_fd < 0) {
+    perror("open reply FIFO");
+    close(command_fd);
+    unlink(command_path);
+    unlink(reply_path);
+    return 1;
+  }
+  if (dup2(reply_fd, STDOUT_FILENO) < 0) {
+    perror("dup2 reply FIFO");
+    close(command_fd);
+    close(reply_fd);
+    unlink(command_path);
+    unlink(reply_path);
+    return 1;
+  }
+  if (reply_fd != STDOUT_FILENO) {
+    close(reply_fd);
+  }
+
+  int result = run_command_loop(command_fd);
+  close(command_fd);
+  unlink(command_path);
+  unlink(reply_path);
+  return result;
+}
+
+int main(int argc, char *argv[]) {
+  if (argc == 5 && strcmp(argv[1], "--child") == 0) {
+    return run_child(argv[2], argv[3], atoi(argv[4]));
+  }
+  if (argc > 1) {
+    fprintf(stderr, "Usage: ./sp\n");
+    return 1;
+  }
+
+  int result = run_command_loop(STDIN_FILENO);
+  terminate_children();
+  return result;
 }
 
 int command_handler(Command *cmd) {
@@ -446,10 +578,108 @@ int command_handler(Command *cmd) {
 }
 
 int create_handler(char *buf, size_t len) {
-  // TODO: Implement the CREATE command handler.
-  (void)buf;
-  (void)len;
-  return -1;
+  char *command_path = NULL;
+  char *reply_path = NULL;
+  int ready_pipe[2] = {-1, -1};
+
+  if (parse_two_keys(buf, len, "create", &command_path, &reply_path) != 0) {
+    fprintf(stderr, "Invalid create command\n");
+    return -1;
+  }
+  if (pipe(ready_pipe) < 0) {
+    perror("pipe");
+    free(command_path);
+    free(reply_path);
+    return -1;
+  }
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    perror("fork");
+    close(ready_pipe[0]);
+    close(ready_pipe[1]);
+    free(command_path);
+    free(reply_path);
+    return -1;
+  }
+
+  if (pid == 0) {
+    char ready_fd_text[32];
+
+    close(ready_pipe[0]);
+    snprintf(ready_fd_text, sizeof(ready_fd_text), "%d", ready_pipe[1]);
+    execl("./sp", "./sp", "--child", command_path, reply_path,
+          ready_fd_text, (char *)NULL);
+    perror("exec ./sp");
+    _exit(127);
+  }
+
+  close(ready_pipe[1]);
+  char ready = '\0';
+  ssize_t ready_result;
+  do {
+    ready_result = read(ready_pipe[0], &ready, 1);
+  } while (ready_result < 0 && errno == EINTR);
+  close(ready_pipe[0]);
+
+  if (ready_result != 1 || ready != 'R') {
+    fprintf(stderr, "Child failed to initialize FIFOs\n");
+    stop_child(pid);
+    reap_child(pid);
+    unlink(command_path);
+    unlink(reply_path);
+    free(command_path);
+    free(reply_path);
+    return -1;
+  }
+
+  int parent_command_fd = open(command_path, O_WRONLY);
+  if (parent_command_fd < 0) {
+    perror("open child command FIFO");
+    stop_child(pid);
+    reap_child(pid);
+    unlink(command_path);
+    unlink(reply_path);
+    free(command_path);
+    free(reply_path);
+    return -1;
+  }
+
+  int parent_reply_fd = open(reply_path, O_RDONLY);
+  if (parent_reply_fd < 0) {
+    perror("open child reply FIFO");
+    close(parent_command_fd);
+    stop_child(pid);
+    reap_child(pid);
+    unlink(command_path);
+    unlink(reply_path);
+    free(command_path);
+    free(reply_path);
+    return -1;
+  }
+
+  Child *child = malloc(sizeof(*child));
+  if (child == NULL) {
+    perror("malloc child");
+    close(parent_command_fd);
+    close(parent_reply_fd);
+    stop_child(pid);
+    reap_child(pid);
+    unlink(command_path);
+    unlink(reply_path);
+    free(command_path);
+    free(reply_path);
+    return -1;
+  }
+
+  child->pid = pid;
+  child->command_fd = parent_command_fd;
+  child->reply_fd = parent_reply_fd;
+  child->command_path = command_path;
+  child->reply_path = reply_path;
+  child->next = children;
+  children = child;
+  return 0;
 }
 
 int store_handler(char *buf, size_t len) {
